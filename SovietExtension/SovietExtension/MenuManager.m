@@ -36,6 +36,12 @@
                                                 keyEquivalent:@""
                                                         state:flag_revoke];
     
+    NSMenuItem *newWeChatMenu= [NSMenuItem menuItemWithTitle:@"多开"
+                                                       action:@selector(onNewWeChat:)
+                                                       target:self
+                                                keyEquivalent:@""
+                                                        state:NO];
+    
    
     NSString *version = [NSString stringWithFormat:@"当前版本 %@", kCurrentVersion];
     NSMenuItem *currentVersionMenu= [NSMenuItem menuItemWithTitle:version
@@ -47,6 +53,7 @@
     NSMenu *subMenu = [[NSMenu alloc] initWithTitle:@"苏维埃助手"];
     [subMenu addItems:@[antiUpdateMenu,
                         antiRevokeMenu,
+                        newWeChatMenu,
                         currentVersionMenu
                       ]];
     

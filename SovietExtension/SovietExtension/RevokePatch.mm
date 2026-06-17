@@ -6,7 +6,7 @@
 //
 //  但我还是想说, 开源共产主义, 爱你们
 //         -- MustangYM 2026-6-16
-
+//0x11ffac000
 #import "RevokePatch.h"
 #import "AntiUpdate.h"
 #import <Foundation/Foundation.h>
@@ -33,6 +33,17 @@ static BOOL YMHasPatchedAntiRevoke = NO;
 // 当前 /Applications/WeChat.app/Contents/Resources/wechat.dylib 的 ASLR slide。
 // dyld 加载 wechat.dylib 后会赋值。
 static uintptr_t YMWeChatDylibSlide = 0;
+
+// 多开 Patch 状态
+static BOOL YMHasPatchedMultiOpenResourceDylib = NO;
+static BOOL YMHasRegisteredDyldCallback = NO;
+
+//static const uintptr_t YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64;
+
+// 先声明，后面 constructor 和 anti revoke 都会用。
+static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide);
+static void YMRegisterDyldCallbackIfNeeded(void);
+static void YMInstallMultiOpenPatch(void);
 
 #pragma mark - MessageWrap 字段布局
 
@@ -84,6 +95,7 @@ typedef struct {
     uintptr_t messageWrapFromRawVA;
     uintptr_t messageWrapDestructVA;
     uintptr_t insertPaySysMsgToSessionVA;
+    uintptr_t YMMultiOpenTryPreventMultiInstanceVA;
 
     YMMessageWrapLayout layout;
 } YMWeChatAdaptProfile;
@@ -114,6 +126,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         // 现成的本地系统消息插入函数。
         // sub_3822FA4：内部会构造 type=10000 + paymsg XML，然后调用 ym_AddLocalMessageWrap。
         .insertPaySysMsgToSessionVA = 0x3822FA4, // [CDATA]->
+        .YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64,
 
         .layout = {
             .messageWrapSize = 616,
@@ -554,6 +567,136 @@ static BOOL YMWritePointer(uintptr_t address,
     return YES;
 }
 
+#pragma mark - ARM64 代码段 Patch
+
+static void YMPrintCodeBytes(const char *name, const char *stage, void *address) {
+    if (!address) {
+        YMLog(@"%s %s address is NULL", name, stage);
+        return;
+    }
+
+    uint32_t bytes[4] = {0};
+    memcpy(bytes, address, sizeof(bytes));
+
+    YMLog(@"%s %s address=%p bytes=%08x %08x %08x %08x",
+          name,
+          stage,
+          address,
+          bytes[0],
+          bytes[1],
+          bytes[2],
+          bytes[3]);
+}
+
+static BOOL YMProtectCodePage(uintptr_t address,
+                              size_t patchSize,
+                              vm_prot_t protection,
+                              const char *name,
+                              const char *stage) {
+    vm_size_t pageSize = (vm_size_t)getpagesize();
+    vm_address_t pageStart = (vm_address_t)(address & ~((uintptr_t)pageSize - 1));
+
+    uintptr_t patchEnd = address + patchSize;
+    uintptr_t pageEnd = (patchEnd + pageSize - 1) & ~((uintptr_t)pageSize - 1);
+
+    vm_size_t protectSize = (vm_size_t)(pageEnd - pageStart);
+
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  pageStart,
+                                  protectSize,
+                                  false,
+                                  protection);
+
+    if (kr != KERN_SUCCESS) {
+        YMLog(@"%s vm_protect %s failed, address=0x%lx, pageStart=0x%lx, size=%lu, kr=%d",
+              name,
+              stage,
+              (unsigned long)address,
+              (unsigned long)pageStart,
+              (unsigned long)protectSize,
+              kr);
+        return NO;
+    }
+
+    return YES;
+}
+
+/*
+ ARM64 BOOL/int 强制返回 YES：
+
+   mov w0, #1
+   ret
+
+ 机器码：
+   20 00 80 52
+   C0 03 5F D6
+
+ 注意：
+   这里用 w0，不用 x0。
+   因为 sub_200730 里是 if (v85 & 1)，本质是 BOOL/int。
+ */
+static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
+    if (address == 0) {
+        YMLog(@"%s patch failed: address is zero", name);
+        return NO;
+    }
+
+    void *target = (void *)address;
+
+    uint32_t patch[2] = {
+        0x52800020, // mov w0, #1
+        0xD65F03C0  // ret
+    };
+
+    YMPrintCodeBytes(name, "before", target);
+
+    uint32_t current[2] = {0};
+    memcpy(current, target, sizeof(current));
+
+    if (current[0] == patch[0] && current[1] == patch[1]) {
+        YMLog(@"%s already patched, address=0x%lx", name, (unsigned long)address);
+        return YES;
+    }
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                           name,
+                           "RW|COPY")) {
+        return NO;
+    }
+
+    memcpy(target, patch, sizeof(patch));
+
+    /*
+     写指令后必须清 i-cache。
+     否则 CPU 可能继续执行旧指令。
+     */
+    sys_icache_invalidate(target, sizeof(patch));
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_EXECUTE,
+                           name,
+                           "RX")) {
+        return NO;
+    }
+
+    YMPrintCodeBytes(name, "after", target);
+
+    uint32_t check[2] = {0};
+    memcpy(check, target, sizeof(check));
+
+    BOOL ok = check[0] == patch[0] && check[1] == patch[1];
+
+    YMLog(@"%s patch result=%@, address=0x%lx",
+          name,
+          ok ? @"OK" : @"FAIL",
+          (unsigned long)address);
+
+    return ok;
+}
+
 #pragma mark - 本地插入灰色系统消息
 
 /*
@@ -834,6 +977,90 @@ static void YMInstallAntiRevokePatch(void) {
     YMFindAndPatchLoadedWeChatResourceDylib();
 }
 
+#pragma mark - 多开 Patch
+
+static BOOL YMPatchMultiOpenWithWeChatDylibSlide(intptr_t slide, NSString *source) {
+    if (YMHasPatchedMultiOpenResourceDylib) {
+        YMLog(@"multi open already patched, skip. source=%@", source);
+        return YES;
+    }
+
+    /*
+     这里仍然复用你的版本匹配逻辑。
+     避免地址漂移后误 patch 新版本。
+     */
+    if (!YMIsTargetWeChatVersion()) {
+        YMLog(@"multi open unsupported version, skip. source=%@", source);
+        return NO;
+    }
+
+    YMWeChatDylibSlide = (uintptr_t)slide;
+
+    uintptr_t tryPreventAddress = YMRuntimeAddress(YMActiveProfile->YMMultiOpenTryPreventMultiInstanceVA);
+
+    YMLog(@"try install multi open patch from %@, slide=0x%lx, sub_1C0A64=0x%lx",
+          source,
+          (unsigned long)YMWeChatDylibSlide,
+          (unsigned long)tryPreventAddress);
+
+    BOOL ok1 = YMPatchARM64ReturnYES(tryPreventAddress,
+                                     "multi open: Resources/wechat.dylib::sub_1C0A64 TryPreventMultiInstance");
+
+    YMHasPatchedMultiOpenResourceDylib = ok1;
+
+    YMLog(@"multi open patch summary: sub_1C0A64=%@, final=%@",
+          ok1 ? @"OK" : @"FAIL",
+          YMHasPatchedMultiOpenResourceDylib ? @"OK" : @"FAIL");
+
+    return YMHasPatchedMultiOpenResourceDylib;
+}
+
+static BOOL YMFindAndPatchLoadedMultiOpenWeChatDylib(void) {
+    uint32_t count = _dyld_image_count();
+
+    YMLog(@"scan dyld images for multi open, count=%u", count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) {
+            continue;
+        }
+
+        NSString *imagePath = [NSString stringWithUTF8String:name];
+
+        if (!YMIsTargetWeChatResourceDylibPath(imagePath)) {
+            continue;
+        }
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        YMLog(@"found Resources/wechat.dylib for multi open: index=%u, slide=0x%lx, path=%@",
+              i,
+              (unsigned long)slide,
+              imagePath);
+
+        return YMPatchMultiOpenWithWeChatDylibSlide(slide, @"dyld image scan");
+    }
+
+    YMLog(@"Resources/wechat.dylib not found for multi open");
+    return NO;
+}
+
+static void YMInstallMultiOpenPatch(void) {
+    if (YMHasPatchedMultiOpenResourceDylib) {
+        return;
+    }
+
+    /*
+     防多开发生在启动早期，所以这里不能 dispatch_after。
+     constructor 进来后立刻：
+       1. 注册 dyld callback
+       2. 扫描已经加载的 wechat.dylib
+     */
+    YMRegisterDyldCallbackIfNeeded();
+    YMFindAndPatchLoadedMultiOpenWeChatDylib();
+}
+
 static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
     const char *name = NULL;
 
@@ -855,11 +1082,33 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
         return;
     }
 
-    YMLog(@"dyld added target image: %@, callback slide=0x%lx",
+    YMLog(@"dyld added target Resources/wechat.dylib: %@, callback slide=0x%lx",
           imagePath,
           (unsigned long)vmaddr_slide);
 
-    YMPatchAntiRevokeWithSlide(vmaddr_slide, @"dyld add image callback");
+    /*
+     多开必须尽早 patch。
+     所以只要 wechat.dylib 被 dyld 加载，就马上 patch sub_1C0A64 / sub_4396B00。
+     */
+    YMPatchMultiOpenWithWeChatDylibSlide(vmaddr_slide, @"dyld add image callback");
+
+    /*
+     防撤回仍然受用户开关控制。
+     */
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
+        YMPatchAntiRevokeWithSlide(vmaddr_slide, @"dyld add image callback");
+    }
+}
+
+static void YMRegisterDyldCallbackIfNeeded(void) {
+    if (YMHasRegisteredDyldCallback) {
+        return;
+    }
+
+    YMHasRegisteredDyldCallback = YES;
+
+    YMLog(@"register dyld add image callback");
+    _dyld_register_func_for_add_image(YMDyldImageAdded);
 }
 
 #pragma mark - 功能安装
@@ -897,7 +1146,7 @@ static void YMInstallAntiRevokeIfNeeded(void) {
      先注册 dyld 回调。
      如果 wechat.dylib 在我们之后加载，可以第一时间拿到 slide。
     */
-    _dyld_register_func_for_add_image(YMDyldImageAdded);
+    YMRegisterDyldCallbackIfNeeded();
 
     /*
      再主动扫描一次。
@@ -923,9 +1172,8 @@ __attribute__((constructor))
 static void YMWeChatAntiRevokePatchEntry(void) {
     @autoreleasepool {
         YMLog(@"constructor called");
-
-        ///TODO 多开
-//        [NSObject startHook];
+        /// 多开必须尽早执行，不能 dispatch_after。
+        YMInstallMultiOpenPatch();
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -951,7 +1199,7 @@ static void YMWeChatAntiRevokePatchEntry(void) {
              先注册 dyld 回调。
              如果 wechat.dylib 在我们之后加载，可以第一时间拿到 slide。
             */
-            _dyld_register_func_for_add_image(YMDyldImageAdded);
+            YMRegisterDyldCallbackIfNeeded();
 
             /*
              再主动扫描一次。
