@@ -6,7 +6,7 @@
 //
 //  但我还是想说, 开源共产主义, 爱你们
 //         -- MustangYM 2026-6-16
-//0x11ffac000
+
 #import "RevokePatch.h"
 #import "AntiUpdate.h"
 #import <Foundation/Foundation.h>
@@ -459,7 +459,7 @@ static std::string YMBuildAntiRevokeSystemXMLContent(void) {
        std::__shared_weak_count::__release_weak(control);
    }
 
- 这里第一版只用于我们自己栈上临时 shared_ptr 的释放。
+ 这里第一版只用于自己栈上临时 shared_ptr 的释放。
  如果测试阶段担心这里有风险，可以临时把调用 YMReleaseSharedPtrStorage 的地方注释掉。
  */
 __attribute__((unused))
@@ -840,7 +840,7 @@ static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
    这是 ym_HandleSysMsg_RevokeMsg 原函数的第二个参数 X1。
    原函数会用 sub_4728670(rawWrap, rawRevokeMessage) 构造一个 MessageWrap。
 
- 我们复用这一步，主要是为了拿到会话相关字段：
+ 复用这一步，主要是为了拿到会话相关字段：
    rawWrap + 24
    rawWrap + 48
 
@@ -992,7 +992,7 @@ static BOOL YMInsertLocalAntiRevokeNotice(int64_t rawRevokeMessage) {
  原函数签名：
    __int64 ym_HandleSysMsg_RevokeMsg(__int64 a1, __int64 a2)
 
- 我们做两件事：
+ 做两件事：
    1. 自己插入一条本地 type=10000 系统消息
    2. return 1，告诉上层这个 sysmsg 已经处理，阻止微信原始撤回逻辑继续执行
  */
@@ -1146,7 +1146,7 @@ static BOOL YMPatchMultiOpenWithWeChatDylibSlide(intptr_t slide, NSString *sourc
     }
 
     /*
-     这里仍然复用你的版本匹配逻辑。
+     这里仍然复用匹配逻辑。
      避免地址漂移后误 patch 新版本。
      */
     if (!YMIsTargetWeChatVersion()) {
@@ -1304,13 +1304,13 @@ static void YMInstallAntiRevokeIfNeeded(void) {
 
     /*
      先注册 dyld 回调。
-     如果 wechat.dylib 在我们之后加载，可以第一时间拿到 slide。
+     如果 wechat.dylib 在之后加载，可以第一时间拿到 slide。
     */
     YMRegisterDyldCallbackIfNeeded();
 
     /*
      再主动扫描一次。
-     如果 wechat.dylib 在我们之前已经加载，可以直接安装 hook。
+     如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
     */
     YMInstallAntiRevokePatch();
 
@@ -1357,13 +1357,13 @@ static void YMWeChatAntiRevokePatchEntry(void) {
         if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
             /*
              先注册 dyld 回调。
-             如果 wechat.dylib 在我们之后加载，可以第一时间拿到 slide。
+             如果 wechat.dylib 在之后加载，可以第一时间拿到 slide。
             */
             YMRegisterDyldCallbackIfNeeded();
 
             /*
              再主动扫描一次。
-             如果 wechat.dylib 在我们之前已经加载，可以直接安装 hook。
+             如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
             */
             YMInstallAntiRevokePatch();
 
