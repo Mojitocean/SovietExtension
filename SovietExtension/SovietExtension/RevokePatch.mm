@@ -26,6 +26,7 @@
 
 #include <string>
 #include <vector>
+#include <set>
 #include <time.h>
 #include <atomic>
 
@@ -3313,7 +3314,8 @@ static BOOL YMRevokeDeleteMessagesHasSavedOriginalBytes = NO;
 static std::atomic_bool YMRevokeDeleteMessagesCallingOriginal(false);
 
 static __thread BOOL YMRevokeDeleteGuardActive = NO;
-static __thread uint64_t YMRevokeLastNoticeSvrIdInCallsite = 0;
+// svrId 去重集合，动态增长匹配实际撤回条数
+static __thread std::set<uint64_t> *YMRevokeSeenSvrIds = nullptr;
 static __thread uint64_t YMRevokeTargetSvrIdForDeleteGuard = 0;
 
 static NSString *YMRevokeMessageTypeName(uint32_t type) {
@@ -3689,8 +3691,11 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
               newMsgID ?: @"",
               revokeXML ?: @"");
 
-        if (YMRevokeLastNoticeSvrIdInCallsite != svrId) {
-            YMRevokeLastNoticeSvrIdInCallsite = svrId;
+        // 去重：根据实际撤回条数动态增长集合
+        if (!YMRevokeSeenSvrIds) YMRevokeSeenSvrIds = new std::set<uint64_t>();
+        bool alreadySeen = YMRevokeSeenSvrIds->count(svrId) > 0;
+        if (!alreadySeen) {
+            YMRevokeSeenSvrIds->insert(svrId);
             if (YMRevokeRealSendForwardEnabled()) {
                 // 群名缓存未命中时主动加载该群数据，触发 UpdateSessionCache 填充缓存
                 if ([sessionText containsString:@"@chatroom"] && YMCachedRoomName(sessionText).length == 0) {
@@ -3873,7 +3878,7 @@ static int64_t YMRevokeDeleteMessagesHook(int64_t manager, std::string *session,
 
             YMRevokeDeleteGuardActive = NO;
             YMRevokeTargetSvrIdForDeleteGuard = 0;
-            YMRevokeLastNoticeSvrIdInCallsite = 0;
+            delete YMRevokeSeenSvrIds; YMRevokeSeenSvrIds = nullptr;
 
             // 伪装删除成功，避免上层重试或卡同步。
             return 1;
