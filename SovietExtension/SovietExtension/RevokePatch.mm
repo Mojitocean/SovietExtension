@@ -20,11 +20,13 @@
 #import <stdarg.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import "ForwardToSelfPatch.h"
 #import "MenuManager.h"
 #import "NSObject+MainHook.h"
 
 #include <string>
 #include <vector>
+#include <set>
 #include <time.h>
 #include <atomic>
 
@@ -139,6 +141,7 @@ typedef struct {
     uintptr_t revokeDeleteMessagesVA;
 
     uintptr_t openURLWebViewKindVA;
+    uintptr_t sendMsgCGIVA;         // sub_8da920: SendMsg CGI dispatcher（撤回转发给我）
 
     YMMessageWrapLayout layout;
     
@@ -195,6 +198,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeDeleteMessagesVA = 0,
 
         .openURLWebViewKindVA = 0,
+        .sendMsgCGIVA = 0,  // 4.1.9 未适配
 
         .layout = {
             .messageWrapSize = 616,
@@ -271,6 +275,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeDeleteMessagesVA = 0x2814B9C,//->Lhook->DeleteMessages
 
         .openURLWebViewKindVA = 0x1C7C6AC, //->Lhook->GetUrlWebViewKind
+        .sendMsgCGIVA = 0x8da920,   // sub_8da920: SendMsg CGI dispatcher
 
         .layout = {
             .messageWrapSize = 616,
@@ -314,6 +319,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
          .revokeOriginCallsiteZeroBranchVA = 新版 CBZ 分支地址，没有就填 0,
          .revokeDeleteMessagesVA = 新版 DeleteMessages 函数入口地址，没有就填 0,
          .openURLWebViewKindVA = 新版 GetUrlWebViewKind 函数入口地址，没有就填 0,
+
+         .sendMsgCGIVA = 新版 SendMsg CGI dispatcher 地址 (sub_8da920)，没有就填 0,
 
          .layout = {
              .messageWrapSize = 616,
@@ -712,6 +719,12 @@ uintptr_t YMRuntimeAddress(uintptr_t staticVA) {
 uintptr_t getDylibSlide()
 {
     return YMWeChatDylibSlide;
+}
+
+uintptr_t YMSendMsgCGIRuntimeAddress(void) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || profile->sendMsgCGIVA == 0) return 0;
+    return YMRuntimeAddress(profile->sendMsgCGIVA);
 }
 
 static inline void *YMRuntimePointer(uintptr_t staticVA) {
@@ -1585,6 +1598,41 @@ static NSMutableDictionary<NSString *, NSString *> *YMGroupExitDisplayNameCache(
         cache = [[NSMutableDictionary alloc] init];
     });
     return cache;
+}
+
+// 群聊 roomID → 群名 缓存，由 UpdateSessionCache hook 喂入。
+// a2 来自 session_service::UpdateSessionCache 的第二个参数：
+//   a2+0x000 = roomID   (std::string, "19228060266@chatroom")
+//   a2+0x120 = 群名     (std::string, "小马甲")
+// 偏移经 2026-06-26 日志确认。新版 wechat.dylib 适配时若失效，
+// 在 hook 里用 YMNSStringFromLibcppStringObject 扫 a2[0..0x400] 重定位即可。
+static NSMutableDictionary<NSString *, NSString *> *YMRoomNameCache(void) {
+    static NSMutableDictionary<NSString *, NSString *> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSMutableDictionary alloc] init];
+    });
+    return cache;
+}
+
+static void YMCacheRoomName(NSString *roomID, NSString *roomName) {
+    if (roomID.length == 0 || roomName.length == 0) return;
+    if (![roomID containsString:@"@chatroom"]) return;
+    if ([roomName containsString:@"@"] || roomName.length > 64) return;
+    NSMutableDictionary<NSString *, NSString *> *cache = YMRoomNameCache();
+    @synchronized (cache) {
+        if (![cache[roomID] isEqualToString:roomName]) {
+            cache[roomID] = roomName;
+        }
+    }
+}
+
+NSString *YMCachedRoomName(NSString *roomID) {
+    if (roomID.length == 0) return @"";
+    NSMutableDictionary<NSString *, NSString *> *cache = YMRoomNameCache();
+    @synchronized (cache) {
+        return cache[roomID] ?: @"";
+    }
 }
 
 // 需要主动预热昵称的群队列。
@@ -3002,6 +3050,15 @@ static void YMGroupExitUpdateSessionCacheHook(uint64_t a1, int64_t a2, int64_t a
     @autoreleasepool {
         YMGroupExitCallOriginalUpdateSessionCache(a1, a2, a3, a4);
 
+        // roomID→群名 缓存：a2+0x000=roomID, a2+0x120=群名（2026-06-26 日志确认）
+        if (a2) {
+            NSString *roomID = YMNSStringFromLibcppStringObject((const void *)((uintptr_t)a2 + 0x00));
+            NSString *roomName = YMNSStringFromLibcppStringObject((const void *)((uintptr_t)a2 + 0x120));
+            if ([roomID containsString:@"@chatroom"] && roomName.length > 0 && ![roomName containsString:@"@"]) {
+                YMCacheRoomName(roomID, roomName);
+            }
+        }
+
         if (YMIsGroupExitMonitorEnabled()) {
             YMGroupExitFlushPreloadRooms("session_service UpdateSessionCache");
             YMGroupExitFlushPendingNotices("session_service UpdateSessionCache");
@@ -3257,7 +3314,8 @@ static BOOL YMRevokeDeleteMessagesHasSavedOriginalBytes = NO;
 static std::atomic_bool YMRevokeDeleteMessagesCallingOriginal(false);
 
 static __thread BOOL YMRevokeDeleteGuardActive = NO;
-static __thread uint64_t YMRevokeLastNoticeSvrIdInCallsite = 0;
+// svrId 去重集合，动态增长匹配实际撤回条数
+static __thread std::set<uint64_t> *YMRevokeSeenSvrIds = nullptr;
 static __thread uint64_t YMRevokeTargetSvrIdForDeleteGuard = 0;
 
 static NSString *YMRevokeMessageTypeName(uint32_t type) {
@@ -3633,8 +3691,26 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
               newMsgID ?: @"",
               revokeXML ?: @"");
 
-        if (YMRevokeLastNoticeSvrIdInCallsite != svrId) {
-            YMRevokeLastNoticeSvrIdInCallsite = svrId;
+        // 去重：根据实际撤回条数动态增长集合
+        if (!YMRevokeSeenSvrIds) YMRevokeSeenSvrIds = new std::set<uint64_t>();
+        bool alreadySeen = YMRevokeSeenSvrIds->count(svrId) > 0;
+        if (!alreadySeen) {
+            YMRevokeSeenSvrIds->insert(svrId);
+            if (YMRevokeRealSendForwardEnabled()) {
+                // 群名缓存未命中时主动加载该群数据，触发 UpdateSessionCache 填充缓存
+                if ([sessionText containsString:@"@chatroom"] && YMCachedRoomName(sessionText).length == 0) {
+                    int64_t mgr = YMGroupExitKnownChatroomManager.load();
+                    if (mgr) {
+                        YMGroupExitPreloadMemberDataListForRoom(mgr, sessionText, "revoke forward fallback");
+                    }
+                }
+                YMForwardToSelfSend(outWrap,
+                                    originType,
+                                    originContent,
+                                    sessionText ?: @"",
+                                    revokerWxid,
+                                    revokerDisplayName);
+            }
             YMInsertDetailedAntiRevokeNoticeFromOrigin(sessionString,
                                                        sessionText,
                                                        svrId,
@@ -3802,7 +3878,7 @@ static int64_t YMRevokeDeleteMessagesHook(int64_t manager, std::string *session,
 
             YMRevokeDeleteGuardActive = NO;
             YMRevokeTargetSvrIdForDeleteGuard = 0;
-            YMRevokeLastNoticeSvrIdInCallsite = 0;
+            delete YMRevokeSeenSvrIds; YMRevokeSeenSvrIds = nullptr;
 
             // 伪装删除成功，避免上层重试或卡同步。
             return 1;
