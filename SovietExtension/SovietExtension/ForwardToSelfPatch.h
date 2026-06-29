@@ -14,6 +14,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <stdint.h>
 
 /// sub_8da920 SendMsg CGI 运行时地址
 uintptr_t YMSendMsgCGIRuntimeAddress(void);
@@ -28,5 +29,7 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
                          uint32_t  originType,
                          NSString *originContent,
                          NSString *sessionText,
+                         NSString *selfUserText,
                          NSString *revokerWxid,
                          NSString *revokerDisplayName);
+

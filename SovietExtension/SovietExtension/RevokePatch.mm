@@ -3706,10 +3706,29 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
                         YMGroupExitPreloadMemberDataListForRoom(mgr, sessionText, "revoke forward fallback");
                     }
                 }
+                NSString *forwardSelfUserText = @"";
+                const YMWeChatAdaptProfile *forwardProfile = YMGetActiveProfile();
+                size_t forwardSelfUserOffset = forwardProfile ? forwardProfile->layout.selfUserOffset : 48;
+
+                /*
+                 不能再SelfPatch里猜,直接把自己的id传进去
+                 */
+                if (revokeWrap != 0) {
+                    forwardSelfUserText = YMNSStringFromLibcppStringObject((const void *)(revokeWrap + forwardSelfUserOffset));
+                }
+
+                YMLog(@"[RevokeCallsite] forward to self explicit selfUser=%@ revokeWrap=0x%lx session=%@ revoker=%@ displayName=%@",
+                      forwardSelfUserText ?: @"",
+                      (unsigned long)revokeWrap,
+                      sessionText ?: @"",
+                      revokerWxid ?: @"",
+                      revokerDisplayName ?: @"");
+
                 YMForwardToSelfSend(outWrap,
                                     originType,
                                     originContent,
                                     sessionText ?: @"",
+                                    forwardSelfUserText ?: @"",
                                     revokerWxid,
                                     revokerDisplayName);
             }

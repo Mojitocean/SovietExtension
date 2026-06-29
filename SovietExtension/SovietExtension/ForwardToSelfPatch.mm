@@ -11,7 +11,7 @@
 //
 //  ★ 依赖（共 1 个 VM 地址）：
 //     sub_8da920 (VA 0x8da920) — SendMsg CGI dispatcher
-//     - Hopper: strings → "sendmsg_Send" 交叉引用定位
+//     - Hopper: strings → "sendmsg_Send" / "send_msg_to_user is empty" 交叉引用定位
 //     - x0 = 请求对象（80*8=640 字节），x1 = 1（发送标志）
 //     - profile.sendMsgCGIVA 管理，YMSendMsgCGIRuntimeAddress() 取
 //
@@ -21,19 +21,19 @@
 //     +0x138: std::string content  （消息正文）
 //     +0x150: std::string from     （发送方 wxid）
 //
-//  ★ 废弃路径（试错记录，供后续版本适配参考）：
-//     ① sub_8d8be8 type=1 → sub_1f3ab7c r2=0 → 只本地插入不走网络
-//     ② sub_8da920 x1=0 → ccmn 检查失败 → 对象缺少关键字段
-//     ③ 0x50FDCC + raw MessageWrap → 撤回栈无 conversation owner → SIGSEGV
-//     ④ Bridge Replay 0x50C8F4 → 跨会话重放崩溃 + 需预热缓存
-//     ⑤ sub_8d8be8 type=0(sub_8da710) → x1 必须有效会话上下文
-//     ⑥ sub_8d8be8 type=3(sub_1f36da8) → CDN hex ≠ 真实 URL，失败
-//     ⑦ sub_569528(extObject, cdnStr, flag) → x0 extObject 无效
+//  ★ 重要修复（2026-06-30）：
+//     旧版在本文件里通过 outWrap+0x30 / outWrap+0x48 猜 selfId。
+//     开源用户反馈：部分环境下提醒消息没有发给自己，反而发给当前聊天对象。
+//     根因就是 outWrap/origin message 的字段在不同场景下可能是当前会话、发送者或群 ID，
+//     不能作为“当前登录账号”来源。
+//     现在改为由 RevokePatch.mm 在“撤回消息 rawWrap”里读取 rawWrap+48，
+//     作为 explicit selfUserText 显式传入；本文件只做安全校验，不再猜 selfId。
+//     如果 selfUserText 不安全，直接跳过发送，宁可不发也不能误发给别人。
 //
 //  ★ MessageWrap 字段布局（616 字节，2026-06-26 日志确认）：
 //     +0x18 (24)  = 会话展示名（私聊=对方号，群聊=群ID?）
-//     +0x30 (48)  = 自身 wxid — 群聊/图片消息时可能变 @chatroom
-//     +0x48 (72)  = 发送者 wxid — 永不 chatroom
+//     +0x30 (48)  = 在撤回消息 rawWrap 中可作为当前登录账号 / 自己
+//     +0x48 (72)  = 发送者 wxid
 //     +0x100(256) = 毫秒创建时间
 //     +0x108(264) = 消息类型 (originType)
 //     +0x114(276) = 秒级创建时间
@@ -41,59 +41,12 @@
 //     +0x148(328) = content/XML（另一偏移，可能冗余）
 //     +0x160(352) = msgSource XML
 //     +0x268(616) = 有效标志 (0=已删除)
-//     selfUser 推断：别人撤回用 +0x30；是 chatroom 则回退 +0x48
-//
-//  ★ 撤回人补齐：图片消息时 FindRevokeXML 返回空，用 +0x48 补齐
 //
 //  ★ 群名获取（0 新增 hook/VM 地址，复用已有基础设施）：
-//     WeChat 没有暴露「给定 roomID 查群名」的同步查询函数。群名走的链路是
-//     Contact 列表 → sub_37ef000 批量遍历 → sub_2f16d4c(Contact, &0x3c0)
-//     → sub_37ec73c → UpdateSessionCache。我们 hook UpdateSessionCache 读取
-//     参数 a2 的固定偏移来获取群名。
-//     Hopper 追踪链（2026-06-26）：
-//       session_service::UpdateSessionCache (0x37EACC0)
-//         ← sub_37ec73c (构造 a2，a2+0x120 由 sub_2f17f3c+204 填入)
-//         ← sub_37f26ac (传入源结构体 [fp-0x40])
-//         ← sub_37f266c (迭代器 wrapper)
-//         ← sub_37fddb8 / sub_37fe74c (Contact 批量处理入口)
-//     ① 主路径：YMCachedRoomName(roomID) 查缓存，偏移（2026-06-26 确认）：
-//          a2+0x000 = roomID   (std::string, "19228060266@chatroom")
-//          a2+0x120 = 群名     (std::string, "小马甲")
-//     ② 兜底：缓存未命中时 RevokePatch 调 GetAllMemberDataList 主动加载，
-//        触发 UpdateSessionCache 后缓存即被填充
-//     ③ 最终回退：以上均失败则直接用 roomID
-//     → 偏移失效时扫 a2[0..0x400] 重定位，或沿上面 Hopper 链重新确认
+//     YMCachedRoomName(roomID) 查缓存，未命中回退为 roomID。
 //
 //  ★ 图片/视频/文件 转发（TODO，当前仅发文本通知）：
-//     试错记录（2026-06-26）：
-//     ⑧ sub_8d8be8 type=3 直调：+0x80 填 session 触发 prologue，CDN hex
-//        数据填入 +0x0c0~+0x150，返回成功但接收端将 CDN hex 误判为链接——
-//        请求对象字段布局不完整。
-//     ⑨ sub_5699d0(service, request)：service 取 savedRegs[0]=0x100..无效、
-//        savedRegs[4]=0xa.. 崩——x1 结构体字段要求不明。
-//     ⑩ sub_486619c 解析 CDN XML：只填 hdlength/thumb 等元数据，不构造完整请求。
-//     ⑪ sub_8d8be8 inline hook 探针：发新图不经过 sub_8d8be8（图片异步上传→回调
-//        直调 sub_56b14c→sub_1f36da8，绕过总调度器）。
-//     Hopper type dispatch（供后续参考）：
-//       sub_8d8be8(0x8d8be8):
-//         loc_8d93f4 type=3→sub_1f36da8   loc_8d925c type=5→sub_8da920
-//       sub_5699d0(service,request):
-//         type=3→sub_56b14c   type=5→sub_8da920
-//     请求对象 type=3 已知字段（loc_8d93f4）：
-//       +0x080=session, +0x0c0=aeskey, +0x0d8=md5,
-//       +0x0f0=cdnbigimgurl, +0x108=cdnmidimgurl, +0x120=to, +0x150=from
-//     outWrap 可用数据（撤回时）：
-//       +0x130=CDN XML   +0x160=msgsource
-//
-//  loc_8d8e10: r8 = *(int32_t *)r19        ; r19 = 请求对象
-//   type 0,1 → loc_8d8f48 → sub_1f3ab7c   (文本，本地)
-//   type 2   → sub_1eca70c                (文件?)
-//   type 3   → loc_8d93f4 → sub_1f36da8   (★ 图片!)
-//   type 4   → sub_1f3fd08                (视频?)
-//   type 5   → loc_8d925c → sub_8da920    (★ 文本，我们用的)
-//   type 6   → sub_1f3dd78                (链接?)
-//   type 7   → sub_1f3eae8                (位置?)
-//   type 8   → loc_8d95c4                (表情/名片?)
+//     当前只发送提醒，不实际转发媒体内容。
 //
 //  ★ 门控：NSUserDefaults("kRevokeForwardToSelfRealSend.SOVIET")
 //         或 /tmp/YMRevokeForwardToSelfRealSend 文件哨兵
@@ -102,15 +55,13 @@
 //
 
 #import "ForwardToSelfPatch.h"
-#import "RevokePatch.h"
 #import <objc/message.h>
 
 #include <string>
+#include <stdarg.h>
 #include <new>
 
-// ============================================================
-// 门控
-// ============================================================
+#pragma mark - 门控
 
 BOOL YMRevokeRealSendForwardEnabled(void) {
     BOOL defaultsArmed = [[NSUserDefaults standardUserDefaults] boolForKey:@"kRevokeForwardToSelfRealSend.SOVIET"];
@@ -118,12 +69,117 @@ BOOL YMRevokeRealSendForwardEnabled(void) {
     return defaultsArmed || fileArmed;
 }
 
-// ============================================================
-// 格式化辅助
-// ============================================================
+#pragma mark - 日志
+
+static void YMForwardLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSLog(@"[YMAntiRevoke] [RevokeAutoForward] %@", msg ?: @"");
+
+    NSString *line = [NSString stringWithFormat:@"[RevokeAutoForward] %@\n", msg ?: @""];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *path = @"/tmp/YMWeChatAntiRevokePatch.log";
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [data writeToFile:path atomically:YES];
+    } else {
+        [fh seekToEndOfFile];
+        [fh writeData:data];
+        [fh closeFile];
+    }
+}
+
+#pragma mark - 字符串 / 安全辅助
+
+static NSString *YMForwardTrim(NSString *value) {
+    if (value.length == 0) {
+        return @"";
+    }
+
+    return [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+}
+
+static BOOL YMForwardStringMatchesPattern(NSString *value, NSString *pattern) {
+    if (value.length == 0 || pattern.length == 0) {
+        return NO;
+    }
+
+    NSError *error = nil;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern
+                                                                           options:0
+                                                                             error:&error];
+    if (error || !regex) {
+        return NO;
+    }
+
+    NSRange fullRange = NSMakeRange(0, value.length);
+    NSTextCheckingResult *match = [regex firstMatchInString:value options:0 range:fullRange];
+    return match && NSEqualRanges(match.range, fullRange);
+}
+
+static BOOL YMForwardLooksLikeAccountID(NSString *value) {
+    NSString *text = YMForwardTrim(value);
+    if (text.length == 0 || text.length > 128) {
+        return NO;
+    }
+
+    if ([text containsString:@"@chatroom"] ||
+        [text containsString:@"\n"] ||
+        [text containsString:@" "] ||
+        [text containsString:@"<"] ||
+        [text containsString:@">"]) {
+        return NO;
+    }
+
+    if ([text hasPrefix:@"wxid_"]) {
+        return YES;
+    }
+
+    // 兼容老微信号 / 自定义微信号，例如 yanmaoweibo / MustangYM001。
+    return YMForwardStringMatchesPattern(text, @"^[A-Za-z0-9_\\-]{5,128}$");
+}
+
+static BOOL YMForwardLooksLikeSafeSelfID(NSString *selfId,
+                                         NSString *sessionText,
+                                         NSString *revokerWxid,
+                                         NSString *revokerDisplayName) {
+    NSString *value = YMForwardTrim(selfId);
+    NSString *session = YMForwardTrim(sessionText);
+    NSString *revoker = YMForwardTrim(revokerWxid);
+
+    if (!YMForwardLooksLikeAccountID(value)) {
+        return NO;
+    }
+
+    // 绝对不能把目标设成群。
+    if ([value containsString:@"@chatroom"]) {
+        return NO;
+    }
+
+    // 私聊场景下，如果目标等于当前会话，极可能就是误把对方当自己。
+    // 自己和自己的会话也可能相等，但宁可跳过，也不能误发给别人。
+    if (session.length > 0 && [value isEqualToString:session]) {
+        return NO;
+    }
+
+    // 如果 revoker 不是“你”，但 selfId 却等于 revoker，也高度可疑。
+    // 这种情况可能是把撤回人/原发送者误当成当前登录账号。
+    BOOL displayMeansMe = [revokerDisplayName isEqualToString:@"你"];
+    if (revoker.length > 0 && [value isEqualToString:revoker] && !displayMeansMe) {
+        return NO;
+    }
+
+    return YES;
+}
+
+#pragma mark - 格式化辅助
 
 static BOOL YMForwardTextIsBuiltinEmoji(NSString *text) {
-    NSString *value = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+    NSString *value = YMForwardTrim(text);
     return value.length >= 3 && value.length <= 32 &&
            [value hasPrefix:@"["] && [value hasSuffix:@"]"] &&
            [value rangeOfString:@"\n"].location == NSNotFound;
@@ -139,22 +195,27 @@ static BOOL YMForwardTextLooksUseless(NSString *text) {
 static NSString *YMForwardCleanContent(NSString *rawContent, NSString **senderOut) {
     if (senderOut) *senderOut = @"";
     if (rawContent.length == 0) return @"";
-    NSString *text = [rawContent stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+
+    NSString *text = YMForwardTrim(rawContent);
     NSRange colonNewline = [text rangeOfString:@":\n"];
     if (colonNewline.location != NSNotFound && colonNewline.location > 0) {
         NSString *prefix = [text substringToIndex:colonNewline.location];
         NSString *body   = [text substringFromIndex:NSMaxRange(colonNewline)];
-        prefix = [prefix stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        body   = [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        prefix = YMForwardTrim(prefix);
+        body   = YMForwardTrim(body);
         if (prefix.length > 0 && senderOut) *senderOut = prefix;
         if (body.length > 0) return body;
     }
+
     return text;
 }
 
 static NSString *YMForwardContentDisplay(uint32_t type, NSString *cleanContent) {
     switch (type) {
-        case 1: return (YMForwardTextIsBuiltinEmoji(cleanContent) && cleanContent.length) ? cleanContent : (cleanContent.length > 0 ? cleanContent : @"（空）");
+        case 1:
+            return (YMForwardTextIsBuiltinEmoji(cleanContent) && cleanContent.length)
+                ? cleanContent
+                : (cleanContent.length > 0 ? cleanContent : @"（空）");
         case 3:  return @"[图片]";
         case 34: return @"[语音]";
         case 43: return @"[视频]";
@@ -172,117 +233,135 @@ static NSString *YMForwardRevokerDisplay(NSString *displayName, NSString *wxid, 
     return @"***";
 }
 
-// ============================================================
-// 构建转发通知文本
-// 格式：
-//   --拦截到一条撤回消息--
-//   群名:xxx
-//   撤回人:xxx
-//   内容:[文本/图片/视频/语音/表情包/…]
-//   (请保证网络良好)
-//
-// 群聊时通过 YMCachedRoomName(sessionText) 查群名（缓存由
-// UpdateSessionCache hook 喂入），未命中回退为 roomID。
-// ============================================================
+#pragma mark - 构建转发通知文本
 
 static NSString *YMBuildRevokeForwardNotice(NSString *sessionText,
-                                      uint32_t    originType,
-                                      NSString   *originRawContent,
-                                      NSString   *revokerWxid,
-                                      NSString   *revokerDisplayName)
-{
+                                            uint32_t originType,
+                                            NSString *originRawContent,
+                                            NSString *revokerWxid,
+                                            NSString *revokerDisplayName) {
     NSString *sender = @"";
-    NSString *clean = originRawContent;
+    NSString *clean = originRawContent ?: @"";
+
     if (originType == 1) {
         clean = YMForwardCleanContent(originRawContent, &sender);
-        if (YMForwardTextLooksUseless(clean)) clean = @"";
+        if (YMForwardTextLooksUseless(clean)) {
+            clean = @"";
+        }
     }
+
     if (clean.length > 1600) {
         clean = [[clean substringToIndex:1600] stringByAppendingString:@"…"];
     }
+
     NSString *contentDisplay = YMForwardContentDisplay(originType, clean);
     NSString *revokerDisplay = YMForwardRevokerDisplay(revokerDisplayName, revokerWxid, sender);
 
     NSMutableString *notice = [NSMutableString string];
     [notice appendString:@"--拦截到一条撤回消息--\n"];
+
     if ([sessionText containsString:@"@chatroom"]) {
         NSString *roomName = YMCachedRoomName(sessionText);
         [notice appendFormat:@"群名:%@\n", roomName.length > 0 ? roomName : (sessionText.length > 0 ? sessionText : @"未知群聊")];
     }
+
     [notice appendFormat:@"撤回人:%@\n", revokerDisplay.length > 0 ? revokerDisplay : @"***"];
     [notice appendFormat:@"内容:%@", contentDisplay.length > 0 ? contentDisplay : @"（空）"];
-    //以后能发送media类型消息后再打开
-//    if (originType != 1) {
-//        [notice appendString:@"\n(请保证网络良好)"];
-//    }
+
     if (originType != 1) {
         [notice appendString:@"\n(非文字消息只做提醒)"];
     }
-    
-    NSTimeInterval interg = [[NSDate date] timeIntervalSince1970];
+
     NSDateFormatter *dateFmt = [[NSDateFormatter alloc] init];
     [dateFmt setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
-    NSString* timeStr = [dateFmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:interg]];
-    [notice appendFormat:@"\n%@", timeStr];
+    NSString *timeStr = [dateFmt stringFromDate:[NSDate date]] ?: @"";
+    if (timeStr.length > 0) {
+        [notice appendFormat:@"\n%@", timeStr];
+    }
+
     return notice;
 }
 
-// ============================================================
-// sub_8da920 type=5 发送：obj+0x000=type, +0x120=to, +0x138=content, +0x150=from
-// ============================================================
+#pragma mark - sub_8da920 type=5 发送
 
 static BOOL YMForwardViaSendMsgCGI(NSString *selfId, NSString *content) {
-    if (!selfId.length || !content.length) return NO;
+    if (!selfId.length || !content.length) {
+        return NO;
+    }
 
     uintptr_t fn = YMSendMsgCGIRuntimeAddress();
-    if (!fn) return NO;
+    if (!fn) {
+        YMForwardLog(@"SendMsg CGI runtime address is zero, skip");
+        return NO;
+    }
 
     uintptr_t obj[80] = {};
     *((uint32_t *)obj) = 5;
-    new ((std::string *)((uintptr_t)obj + 0x120)) std::string(selfId.UTF8String);
-    new ((std::string *)((uintptr_t)obj + 0x138)) std::string(content.UTF8String);
-    new ((std::string *)((uintptr_t)obj + 0x150)) std::string(selfId.UTF8String);
-    @try { ((int64_t(*)(uintptr_t,uintptr_t))fn)((uintptr_t)obj, 1); } @catch(...) {}
-    ((std::string *)((uintptr_t)obj + 0x150))->~basic_string();
-    ((std::string *)((uintptr_t)obj + 0x138))->~basic_string();
-    ((std::string *)((uintptr_t)obj + 0x120))->~basic_string();
-    return YES;
-}
 
-// ============================================================
-// 统一入口
-// ============================================================
+    std::string *toString = (std::string *)((uintptr_t)obj + 0x120);
+    std::string *contentString = (std::string *)((uintptr_t)obj + 0x138);
+    std::string *fromString = (std::string *)((uintptr_t)obj + 0x150);
 
-BOOL YMForwardToSelfSend(uintptr_t outWrap,
-                         uint32_t  originType,
-                         NSString *originContent,
-                         NSString *sessionText,
-                         NSString *revokerWxid,
-                         NSString *revokerDisplayName)
-{
-    if (!outWrap) return NO;
+    const char *selfUTF8 = [selfId UTF8String] ?: "";
+    const char *contentUTF8 = [content UTF8String] ?: "";
 
-    // selfUser 偏移：+0x30(hex) 是自身号但图片/自己撤回时变 chatroom
-    // +0x48(hex) 是发送者号，永不 chatroom
-    NSString *hex30 = [NSString stringWithUTF8String:((std::string *)(outWrap + 0x30))->c_str()];
-    NSString *hex48 = [NSString stringWithUTF8String:((std::string *)(outWrap + 0x48))->c_str()];
-    BOOL revokeByMe = [revokerDisplayName isEqualToString:@"你"];
-    NSString *selfId = revokeByMe ? hex48 : ([hex30 containsString:@"@chatroom"] ? hex48 : hex30);
-    if (!selfId.length) return NO;
+    new (toString) std::string(selfUTF8);
+    new (contentString) std::string(contentUTF8);
+    new (fromString) std::string(selfUTF8);
 
-    // 图片消息时 FindRevokeXML 返回空，用 +0x48 补齐
-    if (revokerWxid.length == 0) revokerWxid = hex48;
-    if (revokerDisplayName.length == 0) revokerDisplayName = [hex48 isEqualToString:selfId] ? @"你" : hex48;
-
-    // 发送文本通知（始终发送，含群名/撤回人/内容概要）
-    NSString *notice = YMBuildRevokeForwardNotice(sessionText, originType,
-                                                   originContent,
-                                                   revokerWxid, revokerDisplayName);
-    if (notice.length) {
-        YMForwardViaSendMsgCGI(selfId, notice);
+    BOOL ok = YES;
+    @try {
+        ((int64_t(*)(uintptr_t, uintptr_t))fn)((uintptr_t)obj, 1);
+    } @catch (...) {
+        ok = NO;
     }
 
-    // TODO: 图片/视频实际内容转发 — 见文件头「图片/视频/文件 转发」试错记录
+    fromString->~basic_string();
+    contentString->~basic_string();
+    toString->~basic_string();
 
-    return YES;
+    return ok;
+}
+
+#pragma mark - 统一入口
+
+BOOL YMForwardToSelfSend(uintptr_t outWrap,
+                         uint32_t originType,
+                         NSString *originContent,
+                         NSString *sessionText,
+                         NSString *selfUserText,
+                         NSString *revokerWxid,
+                         NSString *revokerDisplayName) {
+    (void)outWrap;
+
+    NSString *selfId = YMForwardTrim(selfUserText);
+
+    if (!YMForwardLooksLikeSafeSelfID(selfId, sessionText, revokerWxid, revokerDisplayName)) {
+        YMForwardLog(@"unsafe selfId, skip real send. selfId=%@ session=%@ revoker=%@ displayName=%@ type=%u",
+                     selfId ?: @"",
+                     sessionText ?: @"",
+                     revokerWxid ?: @"",
+                     revokerDisplayName ?: @"",
+                     originType);
+        return NO;
+    }
+
+    NSString *notice = YMBuildRevokeForwardNotice(sessionText ?: @"",
+                                                  originType,
+                                                  originContent ?: @"",
+                                                  revokerWxid ?: @"",
+                                                  revokerDisplayName ?: @"");
+
+    if (notice.length == 0) {
+        YMForwardLog(@"notice is empty, skip real send. selfId=%@ session=%@", selfId ?: @"", sessionText ?: @"");
+        return NO;
+    }
+
+    YMForwardLog(@"send revoke notice to self. selfId=%@ session=%@ type=%u noticeLen=%lu",
+                 selfId ?: @"",
+                 sessionText ?: @"",
+                 originType,
+                 (unsigned long)notice.length);
+
+    return YMForwardViaSendMsgCGI(selfId, notice);
 }
