@@ -632,6 +632,13 @@ static void YMInstallQNSViewHooks(void) {
 @implementation ThemeHook
 
 + (void)start {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL mistyEnabled = [defaults boolForKey:kThemeMistyMode];
+    if (!mistyEnabled) {
+        return;
+    }
+    
+    
     if (gYMStarted) {
         return;
     }
@@ -640,6 +647,8 @@ static void YMInstallQNSViewHooks(void) {
 
     YMLog(@"start");
 
+    [MenuManager shareInstance].hasLoadMistyHook = YES;
+    
     dispatch_async(dispatch_get_main_queue(), ^{
         YMRegisterMistyThemeDefaults();
         YMInstallQNSViewHooks();
